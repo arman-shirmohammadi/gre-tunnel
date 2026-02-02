@@ -1,45 +1,70 @@
 #!/bin/bash
 #
-# Coded by Arman & Un3
+# ====================================
+#   GRE Tunnel Manager
+#   Coded by Arman & Un3
+# ====================================
 #
 
 SERVICE_NAME="gre-tunnel-manager.service"
-SCRIPT_PATH="/usr/local/bin/gre-manager.sh"
+SCRIPT_PATH="/usr/local/bin/gre.sh"
 
-function header() {
+# ---------- UI ----------
+header() {
     clear
     echo "===================================="
-    echo "    GRE Tunnel Manager v1"
-    echo "     Coded by Arman & Un3"
+    echo "        GRE Tunnel Manager"
+    echo "       Coded by Arman & Un3"
     echo "===================================="
+    echo
 }
 
-function list_tunnels() {
-    echo "Existing GRE tunnels:"
-    ip -details link show type gre | grep -E "gre|GRE"
+pause() {
+    read -p "Press Enter to continue..."
 }
 
-function create_tunnel() {
-    read -p "Enter name for GRE interface (e.g. gre0): " TUN
-    read -p "Local IP: " LOCAL
-    read -p "Remote IP: " REMOTE
-    read -p "Assign GRE IP/30 range (local-side): " GREIP
+# ---------- FUNCTIONS ----------
 
-    # Remove existing if exists
-    ip tunnel show | grep -q "$TUN" && {
-        echo "[!] Tunnel $TUN exists — removing..."
+list_tunnels() {
+    echo "[*] Existing GRE tunnels:"
+    echo "------------------------------------"
+    if ip -o tunnel show | grep -q gre; then
+        ip -o tunnel show
+    else
+        echo "No GRE tunnels found."
+    fi
+    echo
+}
+
+create_tunnel() {
+    echo "[*] Create new GRE tunnel"
+    echo "------------------------------------"
+
+    read -p "GRE interface name (e.g. gre0): " TUN
+    read -p "Local public IP: " LOCAL
+    read -p "Remote public IP: " REMOTE
+    read -p "Local GRE IP (/30) e.g. 192.168.10.1/30: " GREIP
+
+    if ip tunnel show | grep -qw "$TUN"; then
+        echo "[!] Tunnel $TUN already exists — removing it first"
         sudo ip tunnel del "$TUN"
-    }
+    fi
 
-    echo "[*] Creating GRE tunnel..."
+    echo "[*] Creating tunnel..."
     sudo ip tunnel add "$TUN" mode gre local "$LOCAL" remote "$REMOTE" ttl 255
     sudo ip addr add "$GREIP" dev "$TUN"
     sudo ip link set "$TUN" up
 
-    echo "[+] Tunnel $TUN created."
+    echo "[+] Tunnel $TUN created successfully"
+    echo
 }
 
-function enable_service() {
+enable_service() {
+    echo "[*] Enabling startup service..."
+
+    sudo cp "$0" "$SCRIPT_PATH"
+    sudo chmod +x "$SCRIPT_PATH"
+
     sudo bash -c "cat > /etc/systemd/system/$SERVICE_NAME <<EOF
 [Unit]
 Description=GRE Tunnel Manager Service
@@ -56,54 +81,66 @@ EOF"
 
     sudo systemctl daemon-reload
     sudo systemctl enable "$SERVICE_NAME"
-    echo "[+] Service enabled."
+
+    echo "[+] Service enabled (runs on boot)"
+    echo
 }
 
-function remove_service() {
+remove_service() {
+    echo "[*] Removing startup service..."
+
     sudo systemctl disable "$SERVICE_NAME" 2>/dev/null
-    sudo rm /etc/systemd/system/"$SERVICE_NAME" 2>/dev/null
+    sudo rm -f /etc/systemd/system/"$SERVICE_NAME"
     sudo systemctl daemon-reload
-    echo "[+] Service removed."
+
+    echo "[+] Service removed"
+    echo
 }
 
-function uninstall_all() {
-    echo "[!] Removing all GRE tunnels..."
-    ip tunnel show | awk '{print $1}' | while read TUNL; do
-        sudo ip tunnel del "$TUNL"
-    done
+uninstall_all() {
+    echo "[!] Removing ALL GRE tunnels"
+    echo "------------------------------------"
+
+    if ip -o tunnel show | grep -q gre; then
+        for TUN in $(ip -o tunnel show | awk -F': ' '{print $1}'); do
+            echo "Removing $TUN ..."
+            sudo ip tunnel del "$TUN"
+        done
+    else
+        echo "No GRE tunnels to remove."
+    fi
+
     remove_service
-    echo "[+] Uninstall completed."
+
+    echo "[+] Uninstall completed"
+    echo
 }
 
-function main_menu() {
-    header
-    echo "1) Install & Configure GRE Tunnel"
-    echo "2) Enable Service (Auto Start on Boot)"
-    echo "3) Remove from Service"
-    echo "4) Uninstall (remove tunnels & cleanup)"
-    echo "5) Show GRE Tunnels"
-    echo "6) Exit"
-    echo "----------------------------------"
-    read -p "Choose an option: " CHOICE
-
-    case "$CHOICE" in
-        1) create_tunnel ;;
-        2) enable_service ;;
-        3) remove_service ;;
-        4) uninstall_all ;;
-        5) list_tunnels ;;
-        6) exit 0 ;;
-        *) echo "Invalid option." ;;
-    esac
-    read -p "Press Enter to continue..."
-    main_menu
-}
-
-# Auto-run from service
+# ---------- AUTO MODE (for systemd) ----------
 if [[ "$1" == "auto" ]]; then
-    header
-    create_tunnel
     exit 0
 fi
 
-main_menu
+# ---------- MENU ----------
+while true; do
+    header
+    echo "1) Create GRE Tunnel"
+    echo "2) Enable Startup Service"
+    echo "3) Remove from Startup"
+    echo "4) Uninstall (Remove all GRE tunnels)"
+    echo "5) List GRE Tunnels"
+    echo "6) Exit"
+    echo "------------------------------------"
+    read -p "Choose an option: " CHOICE
+    echo
+
+    case "$CHOICE" in
+        1) create_tunnel; pause ;;
+        2) enable_service; pause ;;
+        3) remove_service; pause ;;
+        4) uninstall_all; pause ;;
+        5) list_tunnels; pause ;;
+        6) exit 0 ;;
+        *) echo "Invalid option"; pause ;;
+    esac
+done
