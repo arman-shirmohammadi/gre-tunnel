@@ -4,121 +4,143 @@
 
 CYAN=$(tput setaf 6)
 YELLOW=$(tput setaf 3)
+RED=$(tput setaf 1)
+GREEN=$(tput setaf 2)
 RESET=$(tput sgr0)
 
 echo -e "${CYAN}"
 echo "===================================="
 echo "     Coded By Arman & Un3"
-echo "     GRE Tunnel Setup Script"
+echo "     GRE Multi-Tunnel Setup"
 echo "===================================="
 echo -e "${RESET}"
 
-# Function to apply configuration (used by systemd service too)
-apply_config() {
-    if [ ! -f /etc/gre-tunnel.conf ]; then
-        echo "[!] Config file not found: /etc/gre-tunnel.conf"
-        exit 1
+CONFIG_FILE="/etc/gre-tunnels.conf"
+SERVICE_NAME="gre-multi-tunnel.service"
+SCRIPT_PATH=$(realpath "$0")
+
+# Function to apply all tunnels
+apply_all() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "${RED}[!] Config not found: $CONFIG_FILE${RESET}"
+        return 1
     fi
 
-    source /etc/gre-tunnel.conf
+    # Clean old tunnels (optional - can be commented if you want persistence)
+    ip link | grep gre-ir | awk '{print $2}' | cut -d: -f1 | xargs -I {} ip tunnel del {} 2>/dev/null
 
-    # Clean up existing tunnel if exists
-    ip tunnel del vatan-m2 2>/dev/null
-    ip link set vatan-m2 down 2>/dev/null
+    source "$CONFIG_FILE"  # expects IRAN_IP=... and array-like FOREIGN_IPS=(ip1 ip2 ...)
 
-    if [[ "$LOCATION" == "1" ]]; then
-        echo "[*] Applying config for IRAN server..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-        ip tunnel add vatan-m2 mode gre local "$IP_IRAN" remote "$IP_FOREIGN" ttl 255
-        ip link set vatan-m2 up
-        ip addr add 132.168.30.2/30 dev vatan-m2
+    local idx=1
+    for foreign_ip in "${FOREIGN_IPS[@]}"; do
+        local tun="gre-ir${idx}"
+        local local_tun_ip="132.168.30.$((idx*4+2))/30"   # .2, .6, .10, ...
+        local remote_tun_ip="132.168.30.$((idx*4+1))"     # .1, .5, .9, ...
 
-        sysctl -w net.ipv4.ip_forward=1
+        echo "${YELLOW}[*] Setting up tunnel to $foreign_ip (${tun})${RESET}"
 
-        # Apply iptables rules only if not already present
-        iptables -t nat -C PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2 2>/dev/null ||
-            iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 132.168.30.2
+        ip tunnel add "$tun" mode gre local "$IRAN_IP" remote "$foreign_ip" ttl 255
+        ip link set "$tun" up
+        ip addr add "$local_tun_ip" dev "$tun"
 
-        iptables -t nat -C PREROUTING -j DNAT --to-destination 132.168.30.1 2>/dev/null ||
-            iptables -t nat -A PREROUTING -j DNAT --to-destination 132.168.30.1
+        # Example NAT/MASQ rules - adjust as needed
+        iptables -t nat -C POSTROUTING -o "$tun" -j MASQUERADE 2>/dev/null ||
+            iptables -t nat -A POSTROUTING -o "$tun" -j MASQUERADE
 
-        iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null ||
-            iptables -t nat -A POSTROUTING -j MASQUERADE
+        # Optional: route specific traffic or default via one of them
+        # ip route add default via 132.168.30.1 dev gre-ir1 table main  (example)
 
-    elif [[ "$LOCATION" == "2" ]]; then
-        echo "[*] Applying config for FOREIGN server..."
+        ((idx++))
+    done
 
-        ip tunnel add vatan-m2 mode gre local "$IP_FOREIGN" remote "$IP_IRAN" ttl 255
-        ip link set vatan-m2 up
-        ip addr add 132.168.30.1/30 dev vatan-m2
-
-        iptables -C INPUT --proto icmp -j DROP 2>/dev/null ||
-            iptables -A INPUT --proto icmp -j DROP
-
-    else
-        echo "[!] Invalid location in config."
-        exit 1
-    fi
-
-    echo "[+] Configuration applied successfully."
+    echo "${GREEN}[+] All tunnels applied.${RESET}"
 }
 
-# Check if running in --apply mode (for systemd service)
-if [[ "$1" == "--apply" ]]; then
-    apply_config
-    exit 0
-fi
+# Save config (append new foreign)
+add_foreign() {
+    read -p "Enter new FOREIGN server IP: " new_ip
+    if [[ -z "$new_ip" ]]; then return; fi
 
-# Ensure script is run as root
-if [ "$EUID" -ne 0 ]; then
-    echo "[!] Please run as root (sudo)."
-    exit 1
-fi
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        read -p "Enter IRAN public IP: " IRAN_IP
+        echo "IRAN_IP=$IRAN_IP" > "$CONFIG_FILE"
+        FOREIGN_IPS=()
+    fi
 
-# Main menu loop
+    FOREIGN_IPS+=("$new_ip")
+    printf "FOREIGN_IPS=(%s)\n" "${FOREIGN_IPS[*]}" >> "$CONFIG_FILE"
+    echo "${GREEN}[+] Added $new_ip${RESET}"
+}
+
+# Uninstall / Cleanup
+uninstall() {
+    echo "${RED}Uninstalling GRE tunnels...${RESET}"
+
+    # Stop & disable service
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null
+    rm -f /etc/systemd/system/"$SERVICE_NAME"
+
+    # Delete tunnels
+    ip link | grep gre-ir | awk '{print $2}' | cut -d: -f1 | xargs -I {} sh -c 'ip link set {} down; ip tunnel del {}' 2>/dev/null
+
+    # Flush related iptables (careful - only example rules)
+    iptables -t nat -D POSTROUTING -j MASQUERADE 2>/dev/null
+    iptables -t nat -D PREROUTING -j DNAT --to-destination 132.168.30.1 2>/dev/null
+    # Add more -D if you have specific rules
+
+    rm -f "$CONFIG_FILE"
+    systemctl daemon-reload
+
+    echo "${GREEN}[+] Uninstall completed. Tunnels and service removed.${RESET}"
+}
+
+# ------------------ Main Menu ------------------
 while true; do
     echo ""
-    echo "Select an option:"
-    echo "1 - Install / Configure GRE Tunnel"
-    echo "2 - Remove from Startup"
-    echo "3 - Exit"
-    read -p "Enter choice (1-3): " choice
+    echo "1 - Install/Configure (Iran → Multi Foreign)"
+    echo "2 - Add another Foreign server"
+    echo "3 - Apply / Restart tunnels now"
+    echo "4 - Add/Remove from Startup"
+    echo "5 - Uninstall / Complete Cleanup"
+    echo "6 - Exit"
+    read -p "Choice: " opt
 
-    case $choice in
+    case $opt in
         1)
-            echo ""
-            echo "Select server location:"
-            echo "1 - IRAN"
-            echo "2 - FOREIGN"
-            read -p "Enter 1 or 2: " LOCATION
-
-            if [[ "$LOCATION" != "1" && "$LOCATION" != "2" ]]; then
-                echo "[!] Invalid selection."
-                continue
+            if [ -f "$CONFIG_FILE" ]; then
+                echo "${YELLOW}Existing config found. You can add more foreign servers.${RESET}"
+            else
+                read -p "Iran public IP: " IRAN_IP
+                echo "IRAN_IP=$IRAN_IP" > "$CONFIG_FILE"
+                FOREIGN_IPS=()
             fi
-
-            read -p "Enter IRAN server IP: " IP_IRAN
-            read -p "Enter FOREIGN server IP: " IP_FOREIGN
-
-            # Save config
-            cat <<EOF > /etc/gre-tunnel.conf
-LOCATION=$LOCATION
-IP_IRAN=$IP_IRAN
-IP_FOREIGN=$IP_FOREIGN
-EOF
-
-            # Apply now
-            apply_config
-
-            # Ask for startup
-            echo ""
-            read -p "Do you want to add this to startup (run on boot)? (y/n): " add_startup
-            if [[ "$add_startup" =~ ^[Yy]$ ]]; then
-                SCRIPT_PATH=$(realpath "$0")
-
-                cat <<EOF > /etc/systemd/system/gre-tunnel.service
+            add_foreign
+            apply_all
+            ;;
+        2)
+            add_foreign
+            apply_all
+            ;;
+        3)
+            apply_all
+            ;;
+        4)
+            if systemctl list-unit-files | grep -q "$SERVICE_NAME"; then
+                read -p "Remove from startup? (y/n): " rem
+                if [[ "$rem" =~ ^[Yy]$ ]]; then
+                    systemctl disable --now "$SERVICE_NAME"
+                    rm -f /etc/systemd/system/"$SERVICE_NAME"
+                    systemctl daemon-reload
+                    echo "${GREEN}Removed from startup.${RESET}"
+                fi
+            else
+                cat <<EOF > /etc/systemd/system/"$SERVICE_NAME"
 [Unit]
-Description=GRE Tunnel Auto Setup
+Description=Multi GRE Tunnel Setup
 After=network-online.target
 Wants=network-online.target
 
@@ -130,33 +152,19 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
                 systemctl daemon-reload
-                systemctl enable gre-tunnel.service
-                systemctl start gre-tunnel.service 2>/dev/null
-                echo "[+] Added to startup. Service: gre-tunnel.service"
+                systemctl enable "$SERVICE_NAME"
+                systemctl start "$SERVICE_NAME" 2>/dev/null
+                echo "${GREEN}Added to startup.${RESET}"
             fi
             ;;
-
-        2)
-            if [ -f /etc/systemd/system/gre-tunnel.service ]; then
-                systemctl disable gre-tunnel.service
-                systemctl stop gre-tunnel.service 2>/dev/null
-                rm -f /etc/systemd/system/gre-tunnel.service
-                systemctl daemon-reload
-                echo "[+] Removed from startup."
-            else
-                echo "[!] No startup service found."
+        5)
+            read -p "${RED}Are you sure? This removes ALL tunnels, rules and config! (y/N): ${RESET}" confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                uninstall
             fi
             ;;
-
-        3)
-            echo "Exiting..."
-            exit 0
-            ;;
-
-        *)
-            echo "[!] Invalid choice. Try again."
-            ;;
+        6) exit 0 ;;
+        *) echo "Invalid choice" ;;
     esac
 done
