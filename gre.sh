@@ -3,11 +3,11 @@
 # ====================================
 #   GRE Tunnel Manager
 #   Coded by Arman & Un3
-#   Fixed by Grok: root check + permission fix
+#   Fixed & Improved: root check + auto GRE IP + gre0 protection
 # ====================================
 #
 
-# Check if running as root (fix for Operation not permitted)
+# Check if running as root
 if [[ $EUID -ne 0 ]]; then
     echo "[!] This script must be run as root. Elevating privileges..."
     exec sudo "$0" "$@"
@@ -48,22 +48,38 @@ create_tunnel() {
     echo "[*] Create new GRE tunnel"
     echo "------------------------------------"
 
-    read -p "GRE interface name (e.g. gre0): " TUN
-    read -p "Local public IP: " LOCAL                # اگر می‌خوای hardcode کنی، این خط رو حذف کن و بنویس: LOCAL="185.123.45.67"
+    read -p "GRE interface name (e.g. gre1, gre2 – gre0 forbidden!): " TUN
+    if [[ "$TUN" == "gre0" ]]; then
+        echo "[!] Error: 'gre0' is a reserved fallback interface and cannot be deleted or recreated."
+        echo "    Choose a different name like gre1, gre-mytunnel, tunnel1, etc."
+        pause
+        return
+    fi
+
+    read -p "Local public IP: " LOCAL
     read -p "Remote public IP: " REMOTE
-    read -p "Local GRE IP (/30) e.g. 192.168.10.1/30: " GREIP
+
+    # اتوماتیک ست کردن آدرس داخل تونل
+    GREIP="192.168.10.1/30"
+    REMOTE_GREIP="192.168.10.2/30"
+
+    echo "[i] Local tunnel IP   : $GREIP"
+    echo "[i] Remote should use : $REMOTE_GREIP"
+    echo
 
     if ip tunnel show | grep -qw "$TUN"; then
         echo "[!] Tunnel $TUN already exists — removing it first"
-        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Delete failed (may not exist anymore)"
+        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Delete failed (possibly in use or protected)"
     fi
 
     echo "[*] Creating tunnel..."
-    sudo ip tunnel add "$TUN" mode gre local "$LOCAL" remote "$REMOTE" ttl 255
-    sudo ip addr add "$GREIP" dev "$TUN"
-    sudo ip link set "$TUN" up
+    sudo ip tunnel add "$TUN" mode gre local "$LOCAL" remote "$REMOTE" ttl 255 || { echo "[!] Failed to add tunnel"; pause; return; }
+    sudo ip addr add "$GREIP" dev "$TUN" || { echo "[!] Failed to add IP"; pause; return; }
+    sudo ip link set "$TUN" up || { echo "[!] Failed to bring up interface"; pause; return; }
 
     echo "[+] Tunnel $TUN created successfully"
+    echo "    Local  IP inside tunnel: $GREIP"
+    echo "    Remote IP inside tunnel: $REMOTE_GREIP (set this on the other side)"
     echo
 }
 
@@ -88,9 +104,9 @@ WantedBy=multi-user.target
 EOF"
 
     sudo systemctl daemon-reload
-    sudo systemctl enable "$SERVICE_NAME"
+    sudo systemctl enable "$SERVICE_NAME" 2>/dev/null
 
-    echo "[+] Service enabled (runs on boot)"
+    echo "[+] Service enabled (runs on boot - note: currently only placeholder)"
     echo
 }
 
@@ -106,17 +122,13 @@ remove_service() {
 }
 
 uninstall_all() {
-    echo "[!] Removing ALL GRE tunnels"
+    echo "[!] Removing ALL GRE tunnels (except reserved gre0)"
     echo "------------------------------------"
 
-    if ip -o tunnel show | grep -q gre; then
-        for TUN in $(ip -o tunnel show | grep gre | awk -F': ' '{print $1}'); do   # فقط GREها (بهبود کوچک)
-            echo "Removing $TUN ..."
-            sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Failed to remove $TUN"
-        done
-    else
-        echo "No GRE tunnels to remove."
-    fi
+    for TUN in $(ip -o tunnel show | grep -v "gre0@" | grep gre | awk -F': ' '{print $2}' | awk '{print $1}'); do
+        echo "Removing $TUN ..."
+        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Failed to remove $TUN"
+    done
 
     remove_service
 
@@ -126,6 +138,7 @@ uninstall_all() {
 
 # ---------- AUTO MODE (for systemd) ----------
 if [[ "$1" == "auto" ]]; then
+    # اینجا می‌تونی بعداً منطق ساخت تونل ثابت رو بذاری اگر خواستی persist بشه
     exit 0
 fi
 
@@ -148,7 +161,7 @@ while true; do
         3) remove_service; pause ;;
         4) uninstall_all; pause ;;
         5) list_tunnels; pause ;;
-        6) exit 0 ;;
+        6) echo "Goodbye!"; exit 0 ;;
         *) echo "Invalid option"; pause ;;
     esac
 done
