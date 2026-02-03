@@ -3,7 +3,7 @@
 # ====================================
 #   GRE Tunnel Manager
 #   Coded by Arman & Un3
-#   Fixed & Improved: root check + auto GRE IP + gre0 protection
+#   Final version: auto GRE IP + gre0 protection + clean uninstall
 # ====================================
 #
 
@@ -36,11 +36,7 @@ pause() {
 list_tunnels() {
     echo "[*] Existing GRE tunnels:"
     echo "------------------------------------"
-    if ip -o tunnel show | grep -q gre; then
-        ip -o tunnel show
-    else
-        echo "No GRE tunnels found."
-    fi
+    ip -o tunnel show | grep gre || echo "No GRE tunnels found (only default gre0 may exist)."
     echo
 }
 
@@ -48,10 +44,10 @@ create_tunnel() {
     echo "[*] Create new GRE tunnel"
     echo "------------------------------------"
 
-    read -p "GRE interface name (e.g. gre1, gre2 – gre0 forbidden!): " TUN
+    read -p "GRE interface name (e.g. gre1, gre2, mytunnel – gre0 forbidden!): " TUN
     if [[ "$TUN" == "gre0" ]]; then
-        echo "[!] Error: 'gre0' is a reserved fallback interface and cannot be deleted or recreated."
-        echo "    Choose a different name like gre1, gre-mytunnel, tunnel1, etc."
+        echo "[!] Error: 'gre0' is a reserved system interface and cannot be used."
+        echo "    Please choose a different name (e.g. gre1, tunnel1)."
         pause
         return
     fi
@@ -59,7 +55,7 @@ create_tunnel() {
     read -p "Local public IP: " LOCAL
     read -p "Remote public IP: " REMOTE
 
-    # اتوماتیک ست کردن آدرس داخل تونل
+    # آدرس داخل تونل به صورت اتوماتیک
     GREIP="192.168.10.1/30"
     REMOTE_GREIP="192.168.10.2/30"
 
@@ -69,23 +65,22 @@ create_tunnel() {
 
     if ip tunnel show | grep -qw "$TUN"; then
         echo "[!] Tunnel $TUN already exists — removing it first"
-        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Delete failed (possibly in use or protected)"
+        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Could not remove existing tunnel"
     fi
 
     echo "[*] Creating tunnel..."
-    sudo ip tunnel add "$TUN" mode gre local "$LOCAL" remote "$REMOTE" ttl 255 || { echo "[!] Failed to add tunnel"; pause; return; }
-    sudo ip addr add "$GREIP" dev "$TUN" || { echo "[!] Failed to add IP"; pause; return; }
+    sudo ip tunnel add "$TUN" mode gre local "$LOCAL" remote "$REMOTE" ttl 255 || { echo "[!] Failed to create tunnel"; pause; return; }
+    sudo ip addr add "$GREIP" dev "$TUN" || { echo "[!] Failed to assign IP"; pause; return; }
     sudo ip link set "$TUN" up || { echo "[!] Failed to bring up interface"; pause; return; }
 
-    echo "[+] Tunnel $TUN created successfully"
-    echo "    Local  IP inside tunnel: $GREIP"
-    echo "    Remote IP inside tunnel: $REMOTE_GREIP (set this on the other side)"
+    echo "[+] Tunnel $TUN created and up!"
+    echo "    Local inside IP : $GREIP"
+    echo "    Remote inside IP: $REMOTE_GREIP (set this on the opposite server)"
     echo
 }
 
 enable_service() {
-    echo "[*] Enabling startup service..."
-
+    echo "[*] Enabling startup service (placeholder only)"
     sudo cp "$0" "$SCRIPT_PATH"
     sudo chmod +x "$SCRIPT_PATH"
 
@@ -105,40 +100,41 @@ EOF"
 
     sudo systemctl daemon-reload
     sudo systemctl enable "$SERVICE_NAME" 2>/dev/null
-
-    echo "[+] Service enabled (runs on boot - note: currently only placeholder)"
+    echo "[+] Service enabled on boot"
+    echo "    Note: Currently placeholder. To make tunnel persistent, modify 'auto' section later."
     echo
 }
 
 remove_service() {
     echo "[*] Removing startup service..."
-
     sudo systemctl disable "$SERVICE_NAME" 2>/dev/null
     sudo rm -f /etc/systemd/system/"$SERVICE_NAME"
     sudo systemctl daemon-reload
-
     echo "[+] Service removed"
     echo
 }
 
 uninstall_all() {
-    echo "[!] Removing ALL GRE tunnels (except reserved gre0)"
+    echo "[*] Removing all custom GRE tunnels (gre0 will remain - it's normal)"
     echo "------------------------------------"
 
-    for TUN in $(ip -o tunnel show | grep -v "gre0@" | grep gre | awk -F': ' '{print $2}' | awk '{print $1}'); do
+    # فقط اینترفیس‌های GRE که نامشان gre0 نیست را حذف کن
+    for TUN in $(ip -o tunnel show 2>/dev/null | grep gre | grep -v gre0 | awk '{print $1}' | cut -d: -f1); do
         echo "Removing $TUN ..."
-        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Failed to remove $TUN"
+        sudo ip tunnel del "$TUN" 2>/dev/null && echo "[+] $TUN removed" || echo "[!] Failed to remove $TUN"
     done
 
-    remove_service
+    if ! ip -o tunnel show 2>/dev/null | grep -q gre; then
+        echo "No custom tunnels found."
+    fi
 
+    remove_service
     echo "[+] Uninstall completed"
     echo
 }
 
-# ---------- AUTO MODE (for systemd) ----------
+# ---------- AUTO MODE ----------
 if [[ "$1" == "auto" ]]; then
-    # اینجا می‌تونی بعداً منطق ساخت تونل ثابت رو بذاری اگر خواستی persist بشه
     exit 0
 fi
 
@@ -148,7 +144,7 @@ while true; do
     echo "1) Create GRE Tunnel"
     echo "2) Enable Startup Service"
     echo "3) Remove from Startup"
-    echo "4) Uninstall (Remove all GRE tunnels)"
+    echo "4) Uninstall (Remove custom GRE tunnels)"
     echo "5) List GRE Tunnels"
     echo "6) Exit"
     echo "------------------------------------"
