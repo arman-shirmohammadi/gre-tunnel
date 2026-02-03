@@ -3,8 +3,16 @@
 # ====================================
 #   GRE Tunnel Manager
 #   Coded by Arman & Un3
+#   Fixed by Grok: root check + permission fix
 # ====================================
 #
+
+# Check if running as root (fix for Operation not permitted)
+if [[ $EUID -ne 0 ]]; then
+    echo "[!] This script must be run as root. Elevating privileges..."
+    exec sudo "$0" "$@"
+    exit 1
+fi
 
 SERVICE_NAME="gre-tunnel-manager.service"
 SCRIPT_PATH="/usr/local/bin/gre.sh"
@@ -41,13 +49,13 @@ create_tunnel() {
     echo "------------------------------------"
 
     read -p "GRE interface name (e.g. gre0): " TUN
-    read -p "Local public IP: " LOCAL
+    read -p "Local public IP: " LOCAL                # اگر می‌خوای hardcode کنی، این خط رو حذف کن و بنویس: LOCAL="185.123.45.67"
     read -p "Remote public IP: " REMOTE
     read -p "Local GRE IP (/30) e.g. 192.168.10.1/30: " GREIP
 
     if ip tunnel show | grep -qw "$TUN"; then
         echo "[!] Tunnel $TUN already exists — removing it first"
-        sudo ip tunnel del "$TUN"
+        sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Delete failed (may not exist anymore)"
     fi
 
     echo "[*] Creating tunnel..."
@@ -102,9 +110,9 @@ uninstall_all() {
     echo "------------------------------------"
 
     if ip -o tunnel show | grep -q gre; then
-        for TUN in $(ip -o tunnel show | awk -F': ' '{print $1}'); do
+        for TUN in $(ip -o tunnel show | grep gre | awk -F': ' '{print $1}'); do   # فقط GREها (بهبود کوچک)
             echo "Removing $TUN ..."
-            sudo ip tunnel del "$TUN"
+            sudo ip tunnel del "$TUN" 2>/dev/null || echo "[!] Failed to remove $TUN"
         done
     else
         echo "No GRE tunnels to remove."
