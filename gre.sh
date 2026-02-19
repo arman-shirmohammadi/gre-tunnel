@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -e
-
 # ================================================
 #        Coded by arman
 #        GRE Multi Tunnel Manager
@@ -14,6 +13,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+IPTABLES_RULES="/etc/iptables.rules"
 
 # Ask server type only once
 if [ ! -f "$GRE_DIR/server_type" ]; then
@@ -128,6 +129,7 @@ add_tunnel() {
         echo 1 > /proc/sys/net/ipv4/ip_forward
         grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p >/dev/null
+        iptables-save > "$IPTABLES_RULES"
     fi
 
     echo -e "\n${GREEN}Test:${NC} ping $TUN_PEER"
@@ -145,12 +147,21 @@ remove_tunnel() {
 
     IFS='|' read -r name iran_ip foreign_ip local_ip <<< "$line"
     dev="gre-${name}"
+    peer_tun_ip="${local_ip%.2}.1"
+    [ "$SERVER_TYPE" = "foreign" ] && peer_tun_ip="${local_ip%.1}.2"
 
     ip link del "$dev" 2>/dev/null || true
+
+    if [ "$SERVER_TYPE" = "iran" ]; then
+        iptables -t nat -D PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$local_ip" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -j DNAT --to-destination "$peer_tun_ip" 2>/dev/null || true
+        iptables-save > "$IPTABLES_RULES"
+    fi
 
     sed -i "${choice}d" "$GRE_DIR/tunnels.list"
 
     echo -e "${GREEN}Tunnel $name removed${NC}"
+    echo "Run option 3 to update persistence."
 }
 
 enable_persistence() {
@@ -164,6 +175,7 @@ set -e
 
 GRE_DIR="/etc/gre-tunnels"
 SERVER_TYPE=\$(cat "\$GRE_DIR/server_type")
+IPTABLES_RULES="/etc/iptables.rules"
 
 modprobe ip_gre
 
@@ -188,9 +200,7 @@ while IFS='|' read -r name iran_ip foreign_ip tun_ip; do
 done < "\$GRE_DIR/tunnels.list"
 
 if [ "\$SERVER_TYPE" = "iran" ]; then
-  iptables -t nat -A POSTROUTING -j MASQUERADE
-  iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination "\$tun_local"
-  iptables -t nat -A PREROUTING -j DNAT --to-destination "\${tun_local%.2}.1"
+  iptables-restore < "\$IPTABLES_RULES"
   echo 1 > /proc/sys/net/ipv4/ip_forward
   sysctl -p
 fi
@@ -202,7 +212,7 @@ EOF
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=Restore GRE tunnels on boot
+Description=Restore GRE tunnels and iptables on boot
 After=network-online.target
 Wants=network-online.target
 
@@ -218,7 +228,7 @@ EOF
     systemctl daemon-reload
     systemctl enable gre-restore.service
 
-    echo -e "${GREEN}Persistence enabled. Tunnels will restore on reboot.${NC}"
+    echo -e "${GREEN}Persistence enabled. Tunnels and iptables will restore on reboot.${NC}"
 }
 
 show_menu() {
