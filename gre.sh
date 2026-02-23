@@ -15,7 +15,7 @@ show_menu() {
     echo -e "${CYAN}"
     echo "===================================="
     echo " GRE Tunnel Setup Script"
-    echo " GitHub: vatanhost - Edited by Arman"
+    echo " Edited by Arman"
     echo "===================================="
     echo -e "${RESET}"
     echo ""
@@ -442,3 +442,4 @@ while true; do
         *) echo "[!] Invalid choice. Select 1-7."
            read -p "Press Enter..." ;;
     esac
+done
