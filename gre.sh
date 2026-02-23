@@ -1,259 +1,444 @@
-#!/usr/bin/env bash
-set -e
-# ================================================
-#        Coded by arman
-#        GRE Multi Tunnel Manager
-# ================================================
+#!/bin/bash
 
-GRE_DIR="/etc/gre-tunnels"
-mkdir -p "$GRE_DIR"
+CYAN=$(tput setaf 6)
+YELLOW=$(tput setaf 3)
+RESET=$(tput sgr0)
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+CONFIG_DIR="/etc/gre-tunnels"
+SERVICE_FILE="/etc/systemd/system/gre-tunnels-restore.service"
+STARTUP_SCRIPT="/etc/gre-tunnels/restore-gre-tunnels.sh"
 
-IPTABLES_RULES="/etc/iptables.rules"
+[ ! -d "$CONFIG_DIR" ] && sudo mkdir -p "$CONFIG_DIR"
 
-# Ask server type only once
-if [ ! -f "$GRE_DIR/server_type" ]; then
-    echo -e "${GREEN}Which server is this?${NC}"
-    echo "1 = Iran"
-    echo "2 = Foreign"
-    read -rp "Choice (1 or 2): " server_choice
-
-    if [[ "$server_choice" == "1" ]]; then
-        echo "iran" > "$GRE_DIR/server_type"
-    elif [[ "$server_choice" == "2" ]]; then
-        echo "foreign" > "$GRE_DIR/server_type"
-    else
-        echo -e "${RED}Invalid choice. Exiting...${NC}"
-        exit 1
-    fi
-fi
-
-SERVER_TYPE=$(cat "$GRE_DIR/server_type")
-
-show_list() {
-    if [ ! -s "$GRE_DIR/tunnels.list" ]; then
-        echo "No tunnels defined."
-        return
-    fi
-
-    echo -e "\n${YELLOW}Current tunnels:${NC}"
-    printf "%-5s %-18s %-18s %-15s %-15s\n" "ID" "Name" "Iran IP" "Foreign IP" "This Tunnel IP" "Peer Tunnel IP"
-    echo "-----------------------------------------------------------------------"
-    i=1
-    while IFS='|' read -r name iran_ip foreign_ip this_tun_ip; do
-        [ -z "$name" ] && continue
-        peer_tun_ip="${this_tun_ip%.2}.1"
-        [ "$SERVER_TYPE" = "foreign" ] && peer_tun_ip="${this_tun_ip%.1}.2"
-        printf "%-5s %-18s %-18s %-18s %-15s %-15s\n" "$i" "$name" "$iran_ip" "$foreign_ip" "$this_tun_ip" "$peer_tun_ip"
-        ((i++))
-    done < "$GRE_DIR/tunnels.list"
+show_menu() {
+    clear
+    echo -e "${CYAN}"
+    echo "===================================="
+    echo " GRE Tunnel Setup Script"
+    echo " GitHub: vatanhost - Edited by Arman"
+    echo "===================================="
+    echo -e "${RESET}"
     echo ""
+    echo " 1) Create new tunnel"
+    echo " 2) Remove existing tunnel"
+    echo " 3) List all tunnels"
+    echo " 4) Apply / Persist tunnels (survive reboot)"
+    echo " 5) Uninstall persistence"
+    echo " 6) IP Changer (change IPs for existing tunnels)"
+    echo " 7) Exit"
+    echo ""
+    read -p "Select option (1-7): " choice
 }
 
-add_tunnel() {
-    echo -e "\n${GREEN}Add new tunnel${NC}"
-
-    read -rp "Tunnel name (e.g. node1, fra1): " TUN_NAME
-    TUN_NAME=$(echo "$TUN_NAME" | tr -s ' ' '_' | tr -cd '[:alnum:]_-')
-    [ -z "$TUN_NAME" ] && { echo -e "${RED}Name cannot be empty${NC}"; return; }
-
-    grep -q "^$TUN_NAME|" "$GRE_DIR/tunnels.list" 2>/dev/null && {
-        echo -e "${RED}Name already used${NC}"
+create_tunnel() {
+    echo ""
+    echo "Creating new tunnel"
+   
+    echo -n "Tunnel name (example: gre-de1, gre-tr, ir-fr1): "
+    read -r gre_name
+   
+    if [[ -z "$gre_name" || "$gre_name" =~ [[:space:]/] ]]; then
+        echo "[!] Invalid name (no spaces or / allowed)."
+        read -p "Press Enter to continue..."
         return
-    }
-
-    read -rp "Iran IP: " IRAN_IP
-    [[ ! $IRAN_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && {
-        echo -e "${RED}Invalid Iran IP${NC}"
+    fi
+   
+    if [ -f "$CONFIG_DIR/$gre_name" ]; then
+        echo "[!] Tunnel with this name already exists."
+        read -p "Press Enter to continue..."
         return
-    }
-
-    read -rp "Foreign IP: " FOREIGN_IP
-    [[ ! $FOREIGN_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && {
-        echo -e "${RED}Invalid Foreign IP${NC}"
+    fi
+   
+    echo ""
+    echo "Your server location:"
+    echo " 1 = IRAN side"
+    echo " 2 = FOREIGN side"
+    read -r LOCATION
+   
+    if [[ "$LOCATION" != "1" && "$LOCATION" != "2" ]]; then
+        echo "[!] Only 1 or 2 allowed."
+        read -p "Press Enter to continue..."
         return
-    }
-
-    read -rp "Tunnel subnet base (must end with .0, e.g. 10.116.70.0): " SUBNET_BASE
-    [[ ! $SUBNET_BASE =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0$ ]] && {
-        echo -e "${RED}Must end with .0${NC}"
-        return
-    }
-
-    BASE_PREFIX="${SUBNET_BASE%.0}"
-
-    if [ "$SERVER_TYPE" = "iran" ]; then
-        TUN_LOCAL="${BASE_PREFIX}.2"
-        TUN_PEER="${BASE_PREFIX}.1"
-        THIS_IP="$IRAN_IP"
-        PEER_IP="$FOREIGN_IP"
+    fi
+   
+    read -r -p "Iran public IP: " IP_IRAN
+    read -r -p "Foreign public IP: " IP_FOREIGN
+   
+    while true; do
+        echo -n "Subnet base for /30 (example: 10.70.70.0): "
+        read -r input_subnet
+        input_subnet=$(echo "$input_subnet" | xargs | tr -d '[:space:]')
+        if [[ ! $input_subnet =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "[!] Invalid IP format. Use four numbers separated by dots."
+            continue
+        fi
+        IFS='.' read -r o1 o2 o3 o4 <<< "$input_subnet"
+       
+        for octet in "$o1" "$o2" "$o3" "$o4"; do
+            if ! [[ "$octet" =~ ^[0-9]+$ ]] || (( octet < 0 || octet > 255 )); then
+                echo "[!] Invalid octet: $octet (must be 0-255)"
+                continue 2
+            fi
+        done
+       
+        subnet_base="${o1}.${o2}.${o3}.0"
+        if [[ "$input_subnet" != "$subnet_base" ]]; then
+            echo "[i] Corrected to network address: ${subnet_base}"
+        fi
+        break
+    done
+   
+    foreign_ip="${o1}.${o2}.${o3}.1"
+    iran_ip="${o1}.${o2}.${o3}.2"
+    subnet="${subnet_base}/30"
+   
+    echo ""
+    echo "Tunnel IPs will be:"
+    echo " Iran side → ${iran_ip}"
+    echo " Foreign side → ${foreign_ip}"
+    echo " Subnet → ${subnet}"
+    echo ""
+   
+    if [[ "$LOCATION" == "1" ]]; then
+        local_public="$IP_IRAN"
+        remote_public="$IP_FOREIGN"
+        local_tun_ip="$iran_ip"
+        remote_tun_ip="$foreign_ip"
+       
+        echo "[*] Configuring IRAN side..."
+       
+        sudo ip tunnel add "$gre_name" mode gre local "$local_public" remote "$remote_public" ttl 255 || { echo "[!] Failed to create tunnel"; read -p "Press Enter..."; return; }
+        sudo ip link set "$gre_name" mtu 1476 up
+        sudo ip addr add "${local_tun_ip}/30" dev "$gre_name"
+       
+        sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf >/dev/null
+       
+        sudo iptables -t mangle -A POSTROUTING -o "$gre_name" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null
+        sudo iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$local_tun_ip" 2>/dev/null
+        sudo iptables -t nat -C PREROUTING -j DNAT --to-destination "$remote_tun_ip" 2>/dev/null || \
+            sudo iptables -t nat -A PREROUTING -j DNAT --to-destination "$remote_tun_ip" 2>/dev/null
+        sudo iptables -t nat -A POSTROUTING -o "$gre_name" -j MASQUERADE 2>/dev/null
     else
-        TUN_LOCAL="${BASE_PREFIX}.1"
-        TUN_PEER="${BASE_PREFIX}.2"
-        THIS_IP="$FOREIGN_IP"
-        PEER_IP="$IRAN_IP"
+        local_public="$IP_FOREIGN"
+        remote_public="$IP_IRAN"
+        local_tun_ip="$foreign_ip"
+        remote_tun_ip="$iran_ip"
+       
+        echo "[*] Configuring FOREIGN side..."
+       
+        sudo ip tunnel add "$gre_name" mode gre local "$local_public" remote "$remote_public" ttl 255 || { echo "[!] Failed to create tunnel"; read -p "Press Enter..."; return; }
+        sudo ip link set "$gre_name" mtu 1476 up
+        sudo ip addr add "${local_tun_ip}/30" dev "$gre_name"
+       
+        sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+        grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf >/dev/null
+       
+        sudo iptables -t nat -A POSTROUTING -s "$subnet" -j MASQUERADE 2>/dev/null
+        sudo iptables -C INPUT -p icmp -j DROP 2>/dev/null || sudo iptables -A INPUT -p icmp -j DROP 2>/dev/null
     fi
-
-    GRE_DEV="gre-${TUN_NAME}"
-
-    if ip link show "$GRE_DEV" &>/dev/null; then
-        echo -e "${YELLOW}Interface $GRE_DEV exists. Deleting...${NC}"
-        ip link delete "$GRE_DEV" 2>/dev/null || true
-    fi
-
-    ip tunnel add "$GRE_DEV" mode gre local "$THIS_IP" remote "$PEER_IP" ttl 255 || {
-        echo -e "${RED}Failed to add tunnel${NC}"
-        return
-    }
-
-    ip link set "$GRE_DEV" up
-    ip addr add "${TUN_LOCAL}/30" dev "$GRE_DEV"
-
-    echo "${TUN_NAME}|${IRAN_IP}|${FOREIGN_IP}|${TUN_LOCAL}" >> "$GRE_DIR/tunnels.list"
-
-    echo -e "\n${GREEN}Tunnel $TUN_NAME created${NC}"
-    echo -e "  Interface → $GRE_DEV"
-    echo -e "  This IP   → $TUN_LOCAL"
-    echo -e "  Peer IP   → $TUN_PEER"
-
-    if [ "$SERVER_TYPE" = "iran" ]; then
-        echo -e "\n${YELLOW}Applying iptables rules (global)${NC}"
-        iptables -t nat -A POSTROUTING -j MASQUERADE
-        iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$TUN_LOCAL"
-        iptables -t nat -A PREROUTING -j DNAT --to-destination "$TUN_PEER"
-        echo 1 > /proc/sys/net/ipv4/ip_forward
-        grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        sysctl -p >/dev/null
-        iptables-save > "$IPTABLES_RULES"
-    fi
-
-    echo -e "\n${GREEN}Test:${NC} ping $TUN_PEER"
+   
+    cat > "$CONFIG_DIR/$gre_name" <<EOF
+LOCATION=$LOCATION
+IP_IRAN=$IP_IRAN
+IP_FOREIGN=$IP_FOREIGN
+SUBNET_BASE=$subnet_base
+GRE_NAME=$gre_name
+EOF
+   
+    echo ""
+    echo "Tunnel '$gre_name' created successfully."
+    echo "Tunnel IPs → $iran_ip (IRAN) ↔ $foreign_ip (FOREIGN)"
+    echo ""
+    read -p "Press Enter to return to menu..."
 }
 
 remove_tunnel() {
-    show_list
-    [ ! -s "$GRE_DIR/tunnels.list" ] && return
-
-    read -rp "ID to remove (0 = cancel): " choice
-    [[ ! $choice =~ ^[0-9]+$ || $choice -eq 0 ]] && { echo "Cancelled"; return; }
-
-    line=$(sed -n "${choice}p" "$GRE_DIR/tunnels.list")
-    [ -z "$line" ] && { echo -e "${RED}Invalid ID${NC}"; return; }
-
-    IFS='|' read -r name iran_ip foreign_ip local_ip <<< "$line"
-    dev="gre-${name}"
-    peer_tun_ip="${local_ip%.2}.1"
-    [ "$SERVER_TYPE" = "foreign" ] && peer_tun_ip="${local_ip%.1}.2"
-
-    ip link del "$dev" 2>/dev/null || true
-
-    if [ "$SERVER_TYPE" = "iran" ]; then
-        iptables -t nat -D PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$local_ip" 2>/dev/null || true
-        iptables -t nat -D PREROUTING -j DNAT --to-destination "$peer_tun_ip" 2>/dev/null || true
-        iptables-save > "$IPTABLES_RULES"
+    echo ""
+    echo "Remove tunnel"
+    echo "Existing tunnels:"
+    ls -1 "$CONFIG_DIR" 2>/dev/null || echo "(no tunnels found)"
+    echo ""
+    read -r -p "Tunnel name to remove: " gre_name
+   
+    if [ ! -f "$CONFIG_DIR/$gre_name" ]; then
+        echo "[!] Tunnel '$gre_name' not found."
+        read -p "Press Enter..."
+        return
     fi
-
-    sed -i "${choice}d" "$GRE_DIR/tunnels.list"
-
-    echo -e "${GREEN}Tunnel $name removed${NC}"
-    echo "Run option 3 to update persistence."
+   
+    source "$CONFIG_DIR/$gre_name"
+   
+    foreign_ip="${SUBNET_BASE%.*}.1"
+    iran_ip="${SUBNET_BASE%.*}.2"
+    subnet="${SUBNET_BASE}/30"
+   
+    echo "[!] WARNING: Removing this tunnel may break SSH access if it's the only tunnel!"
+    echo "     Make sure you have console access or another way in."
+    read -p "Continue? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "Cancelled."
+        read -p "Press Enter..."
+        return
+    fi
+   
+    # بک‌آپ سریع از iptables قبل حذف
+    sudo iptables-save > "/tmp/iptables-backup-before-remove-$(date +%s).txt" 2>/dev/null
+    echo "[i] iptables backup saved to /tmp/iptables-backup-before-remove-*.txt"
+   
+    if [[ "$LOCATION" == "1" ]]; then
+        local_tun_ip="$iran_ip"
+        remote_tun_ip="$foreign_ip"
+        sudo iptables -t mangle -D POSTROUTING -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null
+        sudo iptables -t nat -D PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$local_tun_ip" 2>/dev/null
+        sudo iptables -t nat -D POSTROUTING -o "$GRE_NAME" -j MASQUERADE 2>/dev/null
+       
+        other_iran=$(ls "$CONFIG_DIR" 2>/dev/null | grep -v "^$gre_name$" | xargs -I {} bash -c 'source "$CONFIG_DIR/{}"; [[ $LOCATION == 1 ]] && echo 1' | wc -l)
+        if [[ $other_iran -eq 0 ]]; then
+            sudo iptables -t nat -D PREROUTING -j DNAT --to-destination "$remote_tun_ip" 2>/dev/null
+            # اضافه کردن قانون ایمن برای SSH به IP محلی (جلوگیری از قطع کامل دسترسی)
+            sudo iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination 127.0.0.1:22 2>/dev/null || true
+            echo "[i] Added fallback SSH rule to localhost to prevent lockout."
+        fi
+    else
+        sudo iptables -t nat -D POSTROUTING -s "$subnet" -j MASQUERADE 2>/dev/null
+        if [ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null | grep -v "^$gre_name$")" ]; then
+            sudo iptables -D INPUT -p icmp -j DROP 2>/dev/null
+        fi
+    fi
+   
+    sudo ip addr del "${local_tun_ip}/30" dev "$GRE_NAME" 2>/dev/null
+    sudo ip link set "$GRE_NAME" down 2>/dev/null
+    sudo ip tunnel del "$GRE_NAME" 2>/dev/null
+   
+    rm -f "$CONFIG_DIR/$gre_name"
+   
+    echo "Tunnel '$gre_name' removed safely."
+    echo "If SSH is still cut, use console to restore iptables backup:"
+    echo "  sudo iptables-restore < /tmp/iptables-backup-before-remove-*.txt"
+    read -p "Press Enter to continue..."
 }
 
-enable_persistence() {
-    echo -e "\n${GREEN}Enabling persistence on reboot${NC}"
+list_tunnels() {
+    echo ""
+    echo "Configured tunnels:"
+    if [ ! "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
+        echo " No tunnels found."
+    else
+        for f in "$CONFIG_DIR"/*; do
+            source "$f"
+            echo ""
+            echo " Tunnel name : $GRE_NAME"
+            echo " Location : $( [[ $LOCATION == 1 ]] && echo IRAN || echo FOREIGN )"
+            echo " Iran IP : $IP_IRAN"
+            echo " Foreign IP : $IP_FOREIGN"
+            echo " Subnet : ${SUBNET_BASE}/30"
+            echo " Tunnel IPs : ${SUBNET_BASE%.*}.2 (IR) ↔ ${SUBNET_BASE%.*}.1 (Foreign)"
+            echo " ────────────────────────────────"
+        done
+    fi
+    echo ""
+    read -p "Press Enter to return..."
+}
 
-    RESTORE_SCRIPT="/etc/gre-restore.sh"
-
-    cat > "$RESTORE_SCRIPT" << EOF
+persist_all() {
+    echo ""
+    echo "[*] Setting up persistence for multiple tunnels..."
+   
+    echo "  Creating startup script..."
+    cat > "$STARTUP_SCRIPT" <<'EOL'
 #!/bin/bash
-set -e
 
-GRE_DIR="/etc/gre-tunnels"
-SERVER_TYPE=\$(cat "\$GRE_DIR/server_type")
-IPTABLES_RULES="/etc/iptables.rules"
+sysctl -w net.ipv4.ip_forward=1 2>/dev/null
 
-modprobe ip_gre
-
-while IFS='|' read -r name iran_ip foreign_ip tun_ip; do
-  [ -z "\$name" ] && continue
-
-  if [ "\$SERVER_TYPE" = "iran" ]; then
-    local_ip="\$iran_ip"
-    remote_ip="\$foreign_ip"
-    tun_local="\$tun_ip"
-  else
-    local_ip="\$foreign_ip"
-    remote_ip="\$iran_ip"
-    tun_local="\$tun_ip"
-  fi
-
-  dev="gre-\${name}"
-
-  ip tunnel add "\$dev" mode gre local "\$local_ip" remote "\$remote_ip" ttl 255
-  ip link set "\$dev" up
-  ip addr add "\$tun_local/30" dev "\$dev"
-done < "\$GRE_DIR/tunnels.list"
-
-if [ "\$SERVER_TYPE" = "iran" ]; then
-  iptables-restore < "\$IPTABLES_RULES"
-  echo 1 > /proc/sys/net/ipv4/ip_forward
-  sysctl -p
-fi
-EOF
-
-    chmod +x "$RESTORE_SCRIPT"
-
-    SERVICE_FILE="/etc/systemd/system/gre-restore.service"
-
-    cat > "$SERVICE_FILE" << EOF
+for conf in /etc/gre-tunnels/*; do
+    [ -f "$conf" ] || continue
+    source "$conf"
+   
+    foreign_ip="${SUBNET_BASE%.*}.1"
+    iran_ip="${SUBNET_BASE%.*}.2"
+   
+    if [[ "$LOCATION" == "1" ]]; then
+        ip tunnel add "$GRE_NAME" mode gre local "$IP_IRAN" remote "$IP_FOREIGN" ttl 255 2>/dev/null || true
+        ip link set "$GRE_NAME" mtu 1476 up 2>/dev/null || true
+        ip addr add "${iran_ip}/30" dev "$GRE_NAME" 2>/dev/null || true
+       
+        iptables -t mangle -A POSTROUTING -o "$GRE_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || true
+        iptables -t nat -A PREROUTING -p tcp --dport 22 -j DNAT --to-destination "$iran_ip" 2>/dev/null || true
+        iptables -t nat -A POSTROUTING -o "$GRE_NAME" -j MASQUERADE 2>/dev/null || true
+       
+        iptables -t nat -C PREROUTING -j DNAT --to-destination "$foreign_ip" 2>/dev/null || \
+            iptables -t nat -A PREROUTING -j DNAT --to-destination "$foreign_ip" 2>/dev/null || true
+    else
+        ip tunnel add "$GRE_NAME" mode gre local "$IP_FOREIGN" remote "$IP_IRAN" ttl 255 2>/dev/null || true
+        ip link set "$GRE_NAME" mtu 1476 up 2>/dev/null || true
+        ip addr add "${foreign_ip}/30" dev "$GRE_NAME" 2>/dev/null || true
+       
+        iptables -t nat -A POSTROUTING -s "${SUBNET_BASE}.0/30" -j MASQUERADE 2>/dev/null || true
+        iptables -A INPUT -p icmp -j DROP 2>/dev/null || true
+    fi
+done
+EOL
+   
+    sudo chmod +x "$STARTUP_SCRIPT" && echo "  Startup script created."
+   
+    echo "  Creating systemd service..."
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Restore GRE tunnels and iptables on boot
+Description=Restore all GRE tunnels and iptables rules after boot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/bin/bash $RESTORE_SCRIPT
-RemainAfterExit=yes
+Type=simple
+ExecStart=$STARTUP_SCRIPT
+Restart=on-failure
+StandardOutput=append:/var/log/gre-tunnels.log
+StandardError=append:/var/log/gre-tunnels.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable gre-restore.service
-
-    echo -e "${GREEN}Persistence enabled. Tunnels and iptables will restore on reboot.${NC}"
+   
+    echo "  Reloading systemd..."
+    sudo systemctl daemon-reload && echo "  Systemd reloaded."
+   
+    echo "  Enabling service..."
+    sudo systemctl enable gre-tunnels-restore.service 2>/dev/null && echo "  Service enabled."
+   
+    echo "  Starting service in background (instant return)..."
+    sudo systemctl start gre-tunnels-restore.service 2>/dev/null &
+   
+    echo ""
+    echo "Persistence setup completed instantly."
+    echo "Service started in background (no wait)."
+    echo ""
+    echo "Check status anytime:"
+    echo "  sudo systemctl status gre-tunnels-restore.service -l"
+    echo "  tail -n 50 /var/log/gre-tunnels.log"
+    echo ""
+    read -p "Press Enter to return to menu..."
 }
 
-show_menu() {
-    clear
-    echo -e "${GREEN}GRE Tunnel Manager ($SERVER_TYPE side)${NC}\n"
-    show_list
+uninstall_persistence() {
     echo ""
-    echo "  1) Add tunnel"
-    echo "  2) Remove tunnel"
-    echo "  3) Enable persistence on reboot"
-    echo "  0) Exit"
+    echo "[*] Uninstalling persistence..."
+   
+    if [ -f "$SERVICE_FILE" ]; then
+        sudo systemctl disable gre-tunnels-restore.service 2>/dev/null
+        sudo systemctl stop gre-tunnels-restore.service 2>/dev/null
+        sudo rm -f "$SERVICE_FILE"
+        echo "  Service removed."
+    fi
+   
+    if [ -f "$STARTUP_SCRIPT" ]; then
+        sudo rm -f "$STARTUP_SCRIPT"
+        echo "  Startup script removed."
+    fi
+   
+    sudo systemctl daemon-reload 2>/dev/null
+   
     echo ""
-    read -rp "Choice: " opt
+    echo "Persistence removed."
+    read -p "Press Enter to continue..."
 }
 
-[ "$EUID" -ne 0 ] && { echo -e "${RED}Run with sudo or as root${NC}"; exit 1; }
+ip_changer() {
+    echo ""
+    echo "IP Changer - Change Iran/Foreign IPs for existing tunnels"
+    echo "----------------------------------------------------------"
+   
+    if [ ! "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
+        echo " No tunnels found."
+        read -p "Press Enter to return..."
+        return
+    fi
+   
+    echo "Available tunnels:"
+    i=1
+    declare -A tunnel_map
+    for f in "$CONFIG_DIR"/*; do
+        GRE_NAME=$(grep '^GRE_NAME=' "$f" | cut -d= -f2-)
+        IP_IRAN=$(grep '^IP_IRAN=' "$f" | cut -d= -f2-)
+        IP_FOREIGN=$(grep '^IP_FOREIGN=' "$f" | cut -d= -f2-)
+        SUBNET_BASE=$(grep '^SUBNET_BASE=' "$f" | cut -d= -f2-)
+       
+        if [[ -n "$GRE_NAME" && -n "$IP_IRAN" && -n "$IP_FOREIGN" ]]; then
+            echo "  $i) $GRE_NAME   |  Iran: $IP_IRAN   |  Foreign: $IP_FOREIGN"
+            tunnel_map[$i]="$f"
+            ((i++))
+        fi
+    done
+   
+    if [ ${#tunnel_map[@]} -eq 0 ]; then
+        echo " No valid tunnels found."
+        read -p "Press Enter to return..."
+        return
+    fi
+   
+    read -p "Select tunnel number to change (or 0 to cancel): " sel
+   
+    if [[ "$sel" == "0" || ! "$sel" =~ ^[0-9]+$ || "$sel" -lt 1 || "$sel" -gt ${#tunnel_map[@]} ]]; then
+        echo "Cancelled."
+        read -p "Press Enter to return..."
+        return
+    fi
+   
+    selected_file="${tunnel_map[$sel]}"
+    source "$selected_file"
+   
+    echo ""
+    echo "Current IPs for $GRE_NAME:"
+    echo "  Iran IP   : $IP_IRAN"
+    echo "  Foreign IP: $IP_FOREIGN"
+   
+    read -r -p "New Iran IP (leave empty to keep current): " new_iran
+    read -r -p "New Foreign IP (leave empty to keep current): " new_foreign
+   
+    if [[ -n "$new_iran" ]]; then
+        IP_IRAN="$new_iran"
+    fi
+   
+    if [[ -n "$new_foreign" ]]; then
+        IP_FOREIGN="$new_foreign"
+    fi
+   
+    cat > "$selected_file" <<EOF
+LOCATION=$LOCATION
+IP_IRAN=$IP_IRAN
+IP_FOREIGN=$IP_FOREIGN
+SUBNET_BASE=$SUBNET_BASE
+GRE_NAME=$GRE_NAME
+EOF
+   
+    echo ""
+    echo "IPs updated successfully for $GRE_NAME"
+    echo "New values:"
+    echo "  Iran IP   : $IP_IRAN"
+    echo "  Foreign IP: $IP_FOREIGN"
+    echo ""
+    echo "Note: Changes are only in config file."
+    echo "To apply immediately: remove and recreate the tunnel."
+    echo "On next reboot (if persistence active): will use new IPs."
+   
+    if sudo systemctl is-active --quiet gre-tunnels-restore.service; then
+        echo "  Restarting persistence service..."
+        sudo systemctl restart gre-tunnels-restore.service 2>/dev/null &
+    fi
+   
+    read -p "Press Enter to return..."
+}
 
 while true; do
     show_menu
-    case $opt in
-        1) add_tunnel ;;
+    case $choice in
+        1) create_tunnel ;;
         2) remove_tunnel ;;
-        3) enable_persistence ;;
-        0) echo -e "\nExiting..."; exit 0 ;;
-        *) echo -e "${RED}Invalid option${NC}" ;;
+        3) list_tunnels ;;
+        4) persist_all ;;
+        5) uninstall_persistence ;;
+        6) ip_changer ;;
+        7) echo -e "\nGoodbye.\n"; exit 0 ;;
+        *) echo "[!] Invalid choice. Select 1-7."
+           read -p "Press Enter..." ;;
     esac
-    read -n1 -rsp $'\nPress Enter to continue...' dummy
-done
